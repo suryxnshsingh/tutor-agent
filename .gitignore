@@ -14,3 +14,5 @@ build/
 .mypy_cache/
 *.egg
 .DS_Store
+CLAUDE.md
+ARCHITECTURE.md
