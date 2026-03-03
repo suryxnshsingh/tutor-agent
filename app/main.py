@@ -3,6 +3,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 import app.tools.resolve_chapter  # noqa: F401
+import app.tools.search_lectures  # noqa: F401
+import app.tools.search_ppt_notes  # noqa: F401
+import app.tools.search_topper_notes  # noqa: F401
 from app.agent.runner import init_session_manager
 from app.gateway.routes import router
 from app.session.dynamo_store import DynamoStore
