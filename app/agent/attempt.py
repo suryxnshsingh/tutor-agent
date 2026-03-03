@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncGenerator
 
 from app.agent.events import (
@@ -11,6 +12,8 @@ from app.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from app.messages.models import InternalMessage
 from app.tools.registry import execute_tool
 
+logger = logging.getLogger(__name__)
+
 
 async def run_attempt(
     system_prompt: str,
@@ -20,7 +23,14 @@ async def run_attempt(
     model: str,
 ) -> AsyncGenerator[AgentEvent, None]:
     """Run a single LLM attempt with tool loop. Stateless — no session or retry logic."""
+    logger.info(
+        "Attempt started — %d tools registered: %s",
+        len(tools),
+        [t.name for t in tools],
+    )
+    iteration = 0
     while True:
+        iteration += 1
         response: LLMResponse = await provider.chat(
             system_prompt=system_prompt,
             messages=messages,
@@ -30,10 +40,21 @@ async def run_attempt(
 
         if response.has_tool_calls:
             for tool_call in response.tool_calls:
+                logger.info(
+                    "Iteration %d — tool call: %s(%s)",
+                    iteration,
+                    tool_call["name"],
+                    tool_call["input"],
+                )
                 yield StatusEvent(content=f"Using {tool_call['name']}...")
 
                 # Execute the tool
                 result = await execute_tool(tool_call["name"], tool_call["input"])
+                logger.info(
+                    "Tool %s returned %d chars",
+                    tool_call["name"],
+                    len(str(result)),
+                )
 
                 # Append tool_call and tool_result to messages for next LLM iteration
                 messages.append(
@@ -54,6 +75,11 @@ async def run_attempt(
         else:
             # Final text response — yield as single delta (non-streaming Phase 1)
             text = response.text or ""
+            logger.info(
+                "Iteration %d — final response (%d chars)",
+                iteration,
+                len(text),
+            )
             yield ResponseStartEvent()
             yield ResponseDelta(content=text)
             yield ResponseEndEvent()

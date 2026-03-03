@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -18,6 +19,67 @@ from app.llm.openai_provider import OpenAIProvider
 from app.messages.models import InternalMessage
 from app.session.manager import SessionManager
 from app.tools.registry import get_all_definitions
+
+logger = logging.getLogger(__name__)
+
+# Tool results that contain resource data to surface as cards.
+# Maps tool name -> key in the result dict that holds the list of items.
+_RESOURCE_TOOLS: dict[str, str] = {
+    "search_lectures": "lectures",
+    "search_topper_notes": "notes",
+    "search_ppt_notes": "notes",
+    "search_pyq_papers": "papers",
+    "search_important_questions": "results",
+    "search_tests": "tests",
+    "search_ncert_solutions": "solutions",
+}
+
+
+def _normalize_language(language: str) -> str:
+    """Map request language to CSV language value. Hinglish -> English."""
+    lang = language.strip().lower()
+    if lang in ("hindi", "hin", "hi", "हिंदी"):
+        return "hindi"
+    return "english"
+
+
+def _filter_by_language(items: list[dict], language: str) -> list[dict]:
+    """Keep only items matching the student's language, if they have one."""
+    filtered = [
+        item for item in items
+        if "language" not in item
+        or item["language"].strip().lower() == language
+    ]
+    # If filtering removes everything, return all (don't lose data)
+    return filtered if filtered else items
+
+
+def _extract_cards(
+    messages: list[InternalMessage],
+    language: str,
+) -> list[dict]:
+    """Extract resource cards from tool_result messages."""
+    cards: list[dict] = []
+    for msg in messages:
+        if msg.role != "tool_result" or not isinstance(msg.result, dict):
+            continue
+        # Find the matching tool_call to get the tool name
+        tool_name = None
+        for prev in messages:
+            if prev.role == "tool_call" and prev.call_id == msg.call_id:
+                tool_name = prev.tool_name
+                break
+        if not tool_name or tool_name not in _RESOURCE_TOOLS:
+            continue
+        items_key = _RESOURCE_TOOLS[tool_name]
+        items = msg.result.get(items_key, [])
+        items = _filter_by_language(items, language)
+        if items:
+            cards.append({
+                "type": tool_name,
+                "data": items,
+            })
+    return cards
 
 
 @dataclass
@@ -77,9 +139,17 @@ async def run(message: UniversalMessage) -> AgentResponse:
     # 5. Create provider
     provider = OpenAIProvider(api_key=settings.openai_api_key)
 
+    logger.info(
+        "run() — chat_id=%s model=%s tools=%s msg_count=%d",
+        message.chat_id,
+        settings.primary_model,
+        [t.name for t in tools],
+        len(session.messages),
+    )
+
     # 6. Run attempt and collect events
     full_text = ""
-    cards: list[dict] = []
+    msg_count_before = len(session.messages)
 
     async for event in run_attempt(
         system_prompt=system_prompt,
@@ -90,17 +160,20 @@ async def run(message: UniversalMessage) -> AgentResponse:
     ):
         if isinstance(event, ResponseDelta):
             full_text += event.content
-        elif isinstance(event, CardsEvent):
-            cards.extend(event.content)
 
-    # 7. Strip thinking tags
+    # 7. Extract resource cards from this request's tool results only
+    new_messages = session.messages[msg_count_before:]
+    lang = _normalize_language(message.language)
+    cards = _extract_cards(new_messages, lang)
+
+    # 8. Strip thinking tags
     thinking = extract_thinking(full_text)
     clean_text = strip_thinking(full_text)
 
-    # 8. Append agent response to session history
+    # 9. Append agent response to session history
     session.messages.append(InternalMessage(role="agent", content=clean_text))
 
-    # 9. Save session (Redis sync, DynamoDB fire-and-forget)
+    # 10. Save session (Redis sync, DynamoDB fire-and-forget)
     await session_mgr.save(session)
 
     return AgentResponse(

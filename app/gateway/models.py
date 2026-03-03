@@ -8,7 +8,7 @@ class ChatRequest(BaseModel):
 
     user_id: str
     text: str
-    course_id: str = Field(alias="board")
+    course_id: str
     class_: str = Field(alias="class")
     subject: str
     language: str = "hinglish"
