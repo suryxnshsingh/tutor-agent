@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from pathlib import Path
 
 from app.config import settings
@@ -24,6 +25,13 @@ def build_system_prompt(
     prompt = prompt.replace("{class}", class_)
     prompt = prompt.replace("{subject}", subject)
     prompt = prompt.replace("{language}", language)
+
+    # Academic year: exams happen Feb-March, so before May the latest
+    # exam year is last calendar year; from May onward it's this year.
+    now = datetime.utcnow()
+    latest_exam_year = now.year if now.month >= 5 else now.year - 1
+    prompt = prompt.replace("{latest_exam_year}", str(latest_exam_year))
+    prompt = prompt.replace("{latest_exam_year_minus_2}", str(latest_exam_year - 2))
 
     # Append course-specific notes if a snippet exists
     snippet_path = _COURSE_SNIPPETS_DIR / f"{course_id}.txt"
