@@ -1,9 +1,10 @@
 import json
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from app.llm.base import LLMProvider, LLMResponse, LLMStreamDelta, ToolDefinition
 from app.messages.models import InternalMessage
 
 
@@ -129,3 +130,56 @@ class OpenAIProvider(LLMProvider):
 
         response = await self.client.chat.completions.create(**kwargs)
         return self.from_provider_response(response)
+
+    async def chat_stream(
+        self,
+        system_prompt: str,
+        messages: list[InternalMessage],
+        tools: list[ToolDefinition],
+        model: str,
+    ) -> AsyncGenerator[LLMStreamDelta, None]:
+        """Send a streaming chat request to OpenAI. Yields LLMStreamDelta chunks."""
+        provider_messages = [
+            {"role": "system", "content": system_prompt},
+            *self.to_provider_messages(messages),
+        ]
+        provider_tools = self.to_provider_tools(tools)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": provider_messages,
+            "stream": True,
+        }
+        if provider_tools:
+            kwargs["tools"] = provider_tools
+
+        stream = await self.client.chat.completions.create(**kwargs)
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason
+
+            # Text delta
+            if delta.content:
+                yield LLMStreamDelta(
+                    text_delta=delta.content,
+                    finish_reason=finish_reason,
+                )
+
+            # Tool call deltas
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    yield LLMStreamDelta(
+                        tool_call_index=tc_delta.index,
+                        tool_call_id=tc_delta.id or None,
+                        tool_call_name=tc_delta.function.name if tc_delta.function and tc_delta.function.name else None,
+                        tool_call_arguments_delta=tc_delta.function.arguments if tc_delta.function and tc_delta.function.arguments else None,
+                        finish_reason=finish_reason,
+                    )
+
+            # Finish reason without content (e.g., stop or tool_calls)
+            if finish_reason and not delta.content and not delta.tool_calls:
+                yield LLMStreamDelta(finish_reason=finish_reason)

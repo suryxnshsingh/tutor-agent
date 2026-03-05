@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 
 from app.messages.models import ChatSession
+from app.session.compaction import get_messages_for_llm
 from app.session.dynamo_store import DynamoStore
 from app.session.redis_store import RedisStore
 
@@ -35,6 +36,8 @@ class SessionManager:
 
         if session is not None:
             logger.debug("Session loaded from DynamoDB, populating Redis: %s", chat_id)
+            # Trim to messages from latest compaction summary onwards
+            session.messages = get_messages_for_llm(session.messages)
             await self.redis.save(session)
             return session
 

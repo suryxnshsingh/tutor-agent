@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,18 @@ class LLMResponse:
     raw: Any = None
 
 
+@dataclass
+class LLMStreamDelta:
+    """A single chunk from a streaming LLM response."""
+
+    text_delta: str | None = None
+    tool_call_index: int | None = None
+    tool_call_id: str | None = None
+    tool_call_name: str | None = None
+    tool_call_arguments_delta: str | None = None
+    finish_reason: str | None = None
+
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
@@ -37,6 +50,17 @@ class LLMProvider(ABC):
         model: str,
     ) -> LLMResponse:
         """Send a chat request to the LLM provider."""
+        ...
+
+    @abstractmethod
+    async def chat_stream(
+        self,
+        system_prompt: str,
+        messages: list[InternalMessage],
+        tools: list[ToolDefinition],
+        model: str,
+    ) -> AsyncGenerator[LLMStreamDelta, None]:
+        """Send a streaming chat request to the LLM provider."""
         ...
 
     @abstractmethod

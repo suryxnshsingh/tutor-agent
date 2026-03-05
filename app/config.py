@@ -26,5 +26,13 @@ class Settings:
 
     agent_name: str = os.getenv("AGENT_NAME", "Arivihan Agent")
 
+    # Platform APIs (coupon & subscription)
+    platform_coupon_url: str = os.getenv("PLATFORM_COUPON_URL", "")
+    platform_subscription_plan_url: str = os.getenv("PLATFORM_SUBSCRIPTION_PLAN_URL", "")
+    platform_token_endpoint: str = os.getenv("PLATFORM_TOKEN_ENDPOINT", "")
+    platform_token_auth: str = os.getenv("PLATFORM_TOKEN_AUTH", "")
+    platform_token_dynamo_table: str = os.getenv("PLATFORM_TOKEN_DYNAMO_TABLE", "MLServiceToken")
+    platform_token_dynamo_region: str = os.getenv("PLATFORM_TOKEN_DYNAMO_REGION", "ap-south-1")
+
 
 settings = Settings()

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict
 
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
+from app.agent.events import ErrorEvent
 from app.agent.runner import run, run_stream
 from app.gateway.models import ChatRequest, ChatResponse, UniversalMessage
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -45,7 +49,15 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
     message = _to_universal(request)
 
     async def event_generator():
-        async for event in run_stream(message):
-            yield {"data": json.dumps(asdict(event))}
+        try:
+            async for event in run_stream(message):
+                yield {"data": json.dumps(asdict(event))}
+        except Exception:
+            logger.exception("Unexpected error in SSE event_generator")
+            error = ErrorEvent(
+                content="Ek chhoti si technical problem aa gayi hai. "
+                "Please thodi der baad dobara try karein! 🙏"
+            )
+            yield {"data": json.dumps(asdict(error))}
 
     return EventSourceResponse(event_generator())

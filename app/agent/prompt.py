@@ -14,6 +14,7 @@ def build_system_prompt(
     class_: str,
     subject: str,
     language: str,
+    user_id: str = "",
     agent_name: str | None = None,
 ) -> str:
     """Build the full system prompt with student context filled in."""
@@ -25,6 +26,7 @@ def build_system_prompt(
     prompt = prompt.replace("{class}", class_)
     prompt = prompt.replace("{subject}", subject)
     prompt = prompt.replace("{language}", language)
+    prompt = prompt.replace("{user_id}", user_id)
 
     # Academic year: exams happen Feb-March, so before May the latest
     # exam year is last calendar year; from May onward it's this year.
