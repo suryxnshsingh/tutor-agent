@@ -54,7 +54,14 @@ async def search_ncert_solutions(
     chapter_number: int | None = None,
     class_: str | None = None,
 ) -> dict:
-    """Find NCERT solutions by subject and optional chapter."""
+    """Search NCERT solutions at two granularity levels.
+
+    - subject only → subject-level: lists all chapters with NCERT solutions available
+    - subject + chapter → chapter-level: returns the chapter's full NCERT solutions PDF
+
+    No topic-level exists — NCERT solutions are organised at chapter level only.
+    If a student asks for a specific topic's solutions, return the chapter PDF.
+    """
     data = _load_ncert_solutions(course_id)
     if not data:
         return {
@@ -63,7 +70,37 @@ async def search_ncert_solutions(
         }
 
     subject_lower = subject.strip().lower()
-    # Match against both Chapter_Name and title (English) for flexibility
+
+    # ── Subject-level: no chapter specified ──
+    if not chapter_name and not chapter_number:
+        subject_rows = [
+            r for r in data
+            if r["Subject"].lower() == subject_lower
+            and (not class_ or r["Class"] == class_)
+        ]
+        if not subject_rows:
+            return {"error": f"No NCERT solutions found for {subject}"}
+
+        subject_rows.sort(key=lambda x: x["Chapter_Number"])
+
+        chapters = []
+        for row in subject_rows:
+            chapters.append({
+                "chapter_name": row.get("Chapter_Name", ""),
+                "title": row.get("title", ""),
+                "chapter_number": row["Chapter_Number"],
+                "language": row.get("language", ""),
+            })
+
+        return {
+            "type": "subject",
+            "subject": subject,
+            "course_id": course_id,
+            "total_chapters": len(chapters),
+            "chapters": chapters,
+        }
+
+    # ── Chapter-level: chapter specified ──
     chapter_lower = chapter_name.strip().lower() if chapter_name else None
 
     results = []
@@ -91,17 +128,25 @@ async def search_ncert_solutions(
             "solution_link": row.get("solution_link", ""),
         })
 
+    if not results:
+        return {"solutions": [], "error": f"No NCERT solutions found for chapter '{chapter_name or chapter_number}'"}
+
     results.sort(key=lambda x: x["chapter_number"])
-    return {"solutions": results}
+    return {
+        "type": "chapter",
+        "solutions": results,
+    }
 
 
 _definition = ToolDefinition(
     name="search_ncert_solutions",
     description=(
-        "Returns NCERT solution PDFs for a subject, optionally "
-        "filtered by chapter. Use when the student asks for NCERT "
-        "solutions, textbook solutions, or exercise solutions. "
-        "Currently available for Maths."
+        "Search for NCERT solutions at two levels: "
+        "1) Subject-level (just subject) → lists all chapters with NCERT solutions available. "
+        "2) Chapter-level (subject + chapter_name or chapter_number) → returns the chapter's full NCERT solutions PDF. "
+        "No topic-level exists — if a student asks for a specific topic's NCERT solution, "
+        "resolve to the chapter and return the chapter PDF. "
+        "Use resolve_chapter first when the student mentions a chapter or topic name."
     ),
     parameters={
         "type": "object",
@@ -118,7 +163,8 @@ _definition = ToolDefinition(
                 "type": "string",
                 "description": (
                     "Chapter name (English). Matches against both "
-                    "chapter name and title fields."
+                    "chapter name and title fields. "
+                    "Omit for subject-level results."
                 ),
             },
             "chapter_number": {

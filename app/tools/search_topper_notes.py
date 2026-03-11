@@ -45,29 +45,65 @@ async def search_topper_notes(
     subject: str,
     course_id: str,
     chapter_name: str | None = None,
-    toppers_name: str | None = None,
     class_: str | None = None,
+    topic: str | None = None,
 ) -> dict:
-    """Find topper notes by chapter and/or topper name."""
+    """Search topper notes at three granularity levels.
+
+    - subject only → subject-level: lists all chapters with topper notes available
+    - subject + chapter → chapter-level: returns the chapter's full topper notes PDF
+    - subject + chapter + topic → topic-level: returns the chapter's topper notes PDF
+      (toppers notes are per-chapter, so topic resolves to the chapter PDF)
+    """
     notes = _load_notes(course_id)
     if not notes:
         return {"notes": [], "error": "No topper notes data for this course"}
 
     subject_lower = subject.strip().lower()
-    chapter_lower = chapter_name.strip().lower() if chapter_name else None
-    toppers_lower = toppers_name.strip().lower() if toppers_name else None
 
+    # ── Subject-level: no chapter specified ──
+    if not chapter_name:
+        subject_rows = [
+            r for r in notes
+            if r["Subject"].lower() == subject_lower
+            and (not class_ or r["Class"] == class_)
+        ]
+        if not subject_rows:
+            return {"error": f"No topper notes found for {subject}"}
+
+        chapters = []
+        for row in subject_rows:
+            chapters.append({
+                "chapter_name": row.get("Chapter_Name", ""),
+                "chapter_number": row.get("Chapter_Number", ""),
+                "notes_id": row.get("notes_id", ""),
+                "language": row.get("language", ""),
+            })
+
+        return {
+            "type": "subject",
+            "subject": subject,
+            "course_id": course_id,
+            "total_chapters": len(chapters),
+            "chapters": chapters,
+        }
+
+    chapter_lower = chapter_name.strip().lower()
+
+    # Filter to chapter + subject + optional class
+    chapter_rows = [
+        r for r in notes
+        if r["Subject"].lower() == subject_lower
+        and r["Chapter_Name"].strip().lower() == chapter_lower
+        and (not class_ or r["Class"] == class_)
+    ]
+
+    if not chapter_rows:
+        return {"notes": [], "error": f"No topper notes found for chapter '{chapter_name}'"}
+
+    # Build chapter-level results (used for both chapter and topic levels)
     results = []
-    for row in notes:
-        if row["Subject"].lower() != subject_lower:
-            continue
-        if chapter_lower and row["Chapter_Name"].strip().lower() != chapter_lower:
-            continue
-        if toppers_lower and row.get("Toppers_Name", "").strip().lower() != toppers_lower:
-            continue
-        if class_ and row["Class"] != class_:
-            continue
-
+    for row in chapter_rows:
         results.append({
             "notes_id": row.get("notes_id", ""),
             "chapter_name": row.get("Chapter_Name", ""),
@@ -79,23 +115,39 @@ async def search_topper_notes(
             "notes_link": row.get("Toppers_Notes_link", ""),
         })
 
-    return {"notes": results}
+    # ── Topic-level: chapter + topic specified ──
+    # Toppers notes are per-chapter PDFs, so topic resolves to the same chapter PDF.
+    if topic:
+        return {
+            "type": "topic",
+            "topic": topic,
+            "notes": results,
+            "note": f"Toppers notes are chapter-level PDFs. Showing notes for chapter '{chapter_name}' which covers '{topic}'.",
+        }
+
+    # ── Chapter-level: chapter specified, no topic ──
+    return {
+        "type": "chapter",
+        "notes": results,
+    }
 
 
 _definition = ToolDefinition(
     name="search_topper_notes",
     description=(
-        "Returns topper notes PDFs filtered by chapter and/or topper "
-        "name. Use AFTER resolve_chapter to get notes for a chapter, "
-        "or pass toppers_name to find all notes by a specific topper. "
-        "At least one of chapter_name or toppers_name must be provided."
+        "Search for topper notes at three levels: "
+        "1) Subject-level (just subject) → lists all chapters with topper notes available. "
+        "2) Chapter-level (subject + chapter_name) → returns the chapter's full topper notes PDF. "
+        "3) Topic-level (subject + chapter_name + topic) → returns the chapter's topper notes PDF "
+        "(toppers notes are per-chapter, so topic resolves to the relevant chapter). "
+        "Use resolve_chapter first when the student mentions a chapter or topic name."
     ),
     parameters={
         "type": "object",
         "properties": {
             "subject": {
                 "type": "string",
-                "description": "The subject (Physics, Chemistry, etc.)",
+                "description": "The subject (Physics, Chemistry, Biology, etc.)",
             },
             "course_id": {
                 "type": "string",
@@ -104,15 +156,8 @@ _definition = ToolDefinition(
             "chapter_name": {
                 "type": "string",
                 "description": (
-                    "The English chapter name from resolve_chapter "
-                    "results (e.g. 'Relations and Functions')"
-                ),
-            },
-            "toppers_name": {
-                "type": "string",
-                "description": (
-                    "Filter by topper name (e.g. 'Priyal Dwivedi'). "
-                    "Returns all notes by this topper."
+                    "The English chapter name from resolve_chapter. "
+                    "Omit for subject-level results."
                 ),
             },
             "class_": {
@@ -120,6 +165,13 @@ _definition = ToolDefinition(
                 "description": (
                     "The student's class number (e.g., '12'). "
                     "Filters to that class. Omit to search all."
+                ),
+            },
+            "topic": {
+                "type": "string",
+                "description": (
+                    "A specific topic within a chapter (e.g. 'Coulomb\\'s Law', 'Fermentation'). "
+                    "Only pass when the student asks for notes on a specific topic, not the whole chapter."
                 ),
             },
         },
