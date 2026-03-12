@@ -30,11 +30,23 @@ class CardsEvent:
 
 
 @dataclass
+class FollowUpEvent:
+    content: str = ""
+    type: str = "follow_up"
+
+
+@dataclass
 class ErrorEvent:
     content: str = ""
     type: str = "error"
 
 
 AgentEvent = (
-    StatusEvent | ResponseStartEvent | ResponseDelta | ResponseEndEvent | CardsEvent | ErrorEvent
+    StatusEvent
+    | ResponseStartEvent
+    | ResponseDelta
+    | ResponseEndEvent
+    | CardsEvent
+    | FollowUpEvent
+    | ErrorEvent
 )

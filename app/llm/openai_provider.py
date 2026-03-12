@@ -1,17 +1,24 @@
 import json
+import logging
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from app.messages.models import InternalMessage
+
+logger = logging.getLogger(__name__)
+
+# 30s connect, 60s read (LLM calls can take a while)
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0)
 
 
 class OpenAIProvider(LLMProvider):
     """OpenAI chat completions adapter."""
 
     def __init__(self, api_key: str):
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_TIMEOUT)
 
     def to_provider_messages(self, messages: list[InternalMessage]) -> list[dict]:
         """Convert InternalMessage list to OpenAI message format."""
@@ -93,16 +100,41 @@ class OpenAIProvider(LLMProvider):
         tool_calls = []
         if message.tool_calls:
             for tc in message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    logger.error(
+                        "Malformed tool args for %s: %s",
+                        tc.function.name,
+                        tc.function.arguments[:200],
+                    )
+                    args = {}
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "input": json.loads(tc.function.arguments),
+                    "input": args,
                 })
+
+        # Extract token usage
+        usage = {}
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            logger.info(
+                "LLM usage — prompt=%d completion=%d total=%d",
+                usage["prompt_tokens"],
+                usage["completion_tokens"],
+                usage["total_tokens"],
+            )
 
         return LLMResponse(
             text=message.content,
             tool_calls=tool_calls,
             has_tool_calls=bool(tool_calls),
+            usage=usage,
             raw=response,
         )
 
@@ -112,6 +144,7 @@ class OpenAIProvider(LLMProvider):
         messages: list[InternalMessage],
         tools: list[ToolDefinition],
         model: str,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Send a non-streaming chat request to OpenAI."""
         provider_messages = [
@@ -126,6 +159,8 @@ class OpenAIProvider(LLMProvider):
         }
         if provider_tools:
             kwargs["tools"] = provider_tools
+        if response_format:
+            kwargs["response_format"] = response_format
 
         response = await self.client.chat.completions.create(**kwargs)
         return self.from_provider_response(response)

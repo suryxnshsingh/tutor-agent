@@ -11,8 +11,10 @@ import app.tools.search_ppt_notes  # noqa: F401
 import app.tools.search_pyq_papers  # noqa: F401
 import app.tools.search_tests  # noqa: F401
 import app.tools.search_topper_notes  # noqa: F401
-from app.agent.runner import init_session_manager
+from app.agent.runner import init_provider, init_session_manager
+from app.config import settings
 from app.gateway.routes import router
+from app.llm.openai_provider import OpenAIProvider
 from app.session.dynamo_store import DynamoStore
 from app.session.manager import SessionManager
 from app.session.redis_store import RedisStore
@@ -29,6 +31,9 @@ async def lifespan(app: FastAPI):
     dynamo_store = DynamoStore()
     session_manager = SessionManager(redis_store=_redis_store, dynamo_store=dynamo_store)
     init_session_manager(session_manager)
+    # Single provider instance — reuses HTTP connections across requests
+    provider = OpenAIProvider(api_key=settings.openai_api_key)
+    init_provider(provider)
     yield
     # Shutdown
     await _redis_store.close()

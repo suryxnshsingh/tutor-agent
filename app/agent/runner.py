@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import time
+import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -8,78 +12,30 @@ from app.agent.attempt import run_attempt
 from app.agent.events import (
     AgentEvent,
     CardsEvent,
+    FollowUpEvent,
     ResponseDelta,
     ResponseEndEvent,
     ResponseStartEvent,
+    StatusEvent,
 )
-from app.agent.prompt import build_system_prompt, extract_thinking, strip_thinking
+from app.agent.prompt import build_teacher_prompt
+from app.agent.subagents.base import SubAgentDispatch, SubAgentResult, TeacherDecision
+from app.agent.subagents.content import run_content_agent
+from app.agent.subagents.doubt import run_doubt_agent
+from app.agent.subagents.guidance import run_guidance_agent
 from app.config import settings
 from app.gateway.models import UniversalMessage
 from app.llm.openai_provider import OpenAIProvider
 from app.messages.models import InternalMessage
 from app.session.manager import SessionManager
-from app.tools.registry import get_all_definitions
+from app.tools.registry import get_definitions_by_names
 
 logger = logging.getLogger(__name__)
 
-# Tool results that contain resource data to surface as cards.
-# Maps tool name -> key in the result dict that holds the list of items.
-_RESOURCE_TOOLS: dict[str, str] = {
-    "search_lectures": "lectures",
-    "search_topper_notes": "notes",
-    "search_ppt_notes": "notes",
-    "search_pyq_papers": "papers",
-    "search_important_questions": "results",
-    "search_tests": "tests",
-    "search_ncert_solutions": "solutions",
-}
+_JSON_FORMAT = {"type": "json_object"}
 
-
-def _normalize_language(language: str) -> str:
-    """Map request language to CSV language value. Hinglish -> English."""
-    lang = language.strip().lower()
-    if lang in ("hindi", "hin", "hi", "हिंदी"):
-        return "hindi"
-    return "english"
-
-
-def _filter_by_language(items: list[dict], language: str) -> list[dict]:
-    """Keep only items matching the student's language, if they have one."""
-    filtered = [
-        item for item in items
-        if "language" not in item
-        or item["language"].strip().lower() == language
-    ]
-    # If filtering removes everything, return all (don't lose data)
-    return filtered if filtered else items
-
-
-def _extract_cards(
-    messages: list[InternalMessage],
-    language: str,
-) -> list[dict]:
-    """Extract resource cards from tool_result messages."""
-    cards: list[dict] = []
-    for msg in messages:
-        if msg.role != "tool_result" or not isinstance(msg.result, dict):
-            continue
-        # Find the matching tool_call to get the tool name
-        tool_name = None
-        for prev in messages:
-            if prev.role == "tool_call" and prev.call_id == msg.call_id:
-                tool_name = prev.tool_name
-                break
-        if not tool_name or tool_name not in _RESOURCE_TOOLS:
-            continue
-        items_key = _RESOURCE_TOOLS[tool_name]
-        items = msg.result.get(items_key, [])
-        items = _filter_by_language(items, language)
-        if items:
-            cards.append({
-                "type": tool_name,
-                "data": items,
-            })
-    return cards
+# Subagent timeout — if one subagent hangs, don't block the whole response
+_SUBAGENT_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -91,10 +47,13 @@ class AgentResponse:
     buttons: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
     thinking: str | None = None
+    follow_up: str | None = None
 
 
-# Module-level session manager — initialized in main.py on startup
+# ── Singletons (set in main.py at startup) ──
+
 _session_manager: SessionManager | None = None
+_provider: OpenAIProvider | None = None
 
 
 def init_session_manager(manager: SessionManager) -> None:
@@ -102,94 +61,155 @@ def init_session_manager(manager: SessionManager) -> None:
     _session_manager = manager
 
 
+def init_provider(provider: OpenAIProvider) -> None:
+    global _provider
+    _provider = provider
+
+
 def get_session_manager() -> SessionManager:
     if _session_manager is None:
-        raise RuntimeError("SessionManager not initialized. Call init_session_manager() first.")
+        raise RuntimeError("SessionManager not initialized.")
     return _session_manager
 
 
-async def run(message: UniversalMessage) -> AgentResponse:
-    """Session-aware runner: loads history, runs attempt, saves session."""
+def get_provider() -> OpenAIProvider:
+    if _provider is None:
+        raise RuntimeError("OpenAIProvider not initialized.")
+    return _provider
 
-    session_mgr = get_session_manager()
 
-    # 1. Load or create session
-    session = await session_mgr.load(
-        chat_id=message.chat_id,
-        user_id=message.user_id,
-        subject=message.subject,
-        course_id=message.course_id,
-    )
+# ── Teacher routing ──
 
-    # 2. Build system prompt
-    system_prompt = build_system_prompt(
-        course_id=message.course_id,
-        class_=message.class_,
-        subject=message.subject,
-        language=message.language,
-    )
 
-    # 3. Append student message to session history
-    student_msg = InternalMessage(role="student", content=message.text)
-    session.messages.append(student_msg)
+async def _run_teacher(
+    system_prompt: str,
+    messages: list[InternalMessage],
+    provider: OpenAIProvider,
+    trace_id: str,
+) -> TeacherDecision:
+    """Run the teacher LLM call with resolve_chapter tool. Returns structured routing decision."""
+    start = time.monotonic()
+    teacher_tools = get_definitions_by_names(["resolve_chapter"])
 
-    # 4. Get tool definitions
-    tools = get_all_definitions()
+    # IMPORTANT: copy messages so tool_call/tool_result don't leak into session
+    teacher_messages = list(messages)
 
-    # 5. Create provider
-    provider = OpenAIProvider(api_key=settings.openai_api_key)
-
-    logger.info(
-        "run() — chat_id=%s model=%s tools=%s msg_count=%d",
-        message.chat_id,
-        settings.primary_model,
-        [t.name for t in tools],
-        len(session.messages),
-    )
-
-    # 6. Run attempt and collect events
+    # Run attempt — teacher may call resolve_chapter before producing JSON
     full_text = ""
-    msg_count_before = len(session.messages)
-
     async for event in run_attempt(
         system_prompt=system_prompt,
-        messages=session.messages,
-        tools=tools,
+        messages=teacher_messages,
+        tools=teacher_tools,
         provider=provider,
-        model=settings.primary_model,
+        model=settings.fast_model,
+        response_format=_JSON_FORMAT,
     ):
         if isinstance(event, ResponseDelta):
             full_text += event.content
 
-    # 7. Extract resource cards from this request's tool results only
-    new_messages = session.messages[msg_count_before:]
-    lang = _normalize_language(message.language)
-    cards = _extract_cards(new_messages, lang)
+    elapsed = round(time.monotonic() - start, 2)
+    logger.info("[%s] Teacher routing completed in %.2fs", trace_id, elapsed)
 
-    # 8. Strip thinking tags
-    thinking = extract_thinking(full_text)
-    clean_text = strip_thinking(full_text)
+    # Parse JSON response into TeacherDecision
+    try:
+        data = json.loads(full_text)
+    except json.JSONDecodeError:
+        logger.error("Teacher returned invalid JSON: %s", full_text[:500])
+        return TeacherDecision(
+            type="direct_response",
+            direct_response="Kuch technical issue aa raha hai, thodi der mein try karo.",
+        )
 
-    # 9. Append agent response to session history
-    session.messages.append(InternalMessage(role="agent", content=clean_text))
+    # Build SubAgentDispatch list
+    subagents = []
+    for sa in data.get("subagents", []):
+        subagents.append(SubAgentDispatch(
+            agent=sa.get("agent", ""),
+            input=sa.get("input", ""),
+            language=sa.get("language", "hinglish"),
+            nudge=sa.get("nudge"),
+            content_types=sa.get("content_types", []),
+            chapter_id=sa.get("chapter_id"),
+            chapter_name=sa.get("chapter_name"),
+        ))
 
-    # 10. Save session (Redis sync, DynamoDB fire-and-forget)
-    await session_mgr.save(session)
-
-    return AgentResponse(
-        text=clean_text,
-        cards=cards,
-        metadata={"chat_id": message.chat_id, "model": settings.primary_model},
-        thinking=thinking,
+    return TeacherDecision(
+        type=data.get("type", "direct_response"),
+        direct_response=data.get("direct_response"),
+        chapter_id=data.get("chapter_id"),
+        chapter_name=data.get("chapter_name"),
+        subagents=subagents,
+        follow_up=data.get("follow_up"),
     )
 
 
-async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, None]:
-    """Streaming runner: yields AgentEvents in real-time, saves session after stream completes."""
+# ── Subagent dispatch ──
 
+
+async def _dispatch_subagent(
+    dispatch: SubAgentDispatch,
+    message: UniversalMessage,
+    provider: OpenAIProvider,
+) -> SubAgentResult:
+    """Run a single subagent based on the dispatch instructions."""
+    common = {
+        "input_text": dispatch.input,
+        "language": dispatch.language,
+        "class_": message.class_,
+        "subject": message.subject,
+        "course_id": message.course_id,
+        "provider": provider,
+    }
+
+    if dispatch.agent == "doubt":
+        return await run_doubt_agent(**common)
+
+    if dispatch.agent == "content":
+        return await run_content_agent(
+            **common,
+            content_types=dispatch.content_types,
+            chapter_name=dispatch.chapter_name,
+            chapter_id=dispatch.chapter_id,
+        )
+
+    if dispatch.agent == "guidance":
+        return await run_guidance_agent(**common)
+
+    logger.warning("Unknown subagent type: %s", dispatch.agent)
+    return SubAgentResult(status="error", metadata={"error": f"Unknown agent: {dispatch.agent}"})
+
+
+# ── Response assembly ──
+
+
+def _assemble_response(
+    decision: TeacherDecision,
+    results: list[SubAgentResult],
+) -> tuple[str, list[dict]]:
+    """Programmatically assemble text and cards from subagent results."""
+    text_parts: list[str] = []
+    all_cards: list[dict] = []
+
+    for result in results:
+        if result.text:
+            text_parts.append(result.text)
+        if result.cards:
+            all_cards.extend(result.cards)
+
+    combined_text = "\n\n".join(text_parts) if text_parts else ""
+    return combined_text, all_cards
+
+
+# ── Public API ──
+
+
+async def run(message: UniversalMessage) -> AgentResponse:
+    """Teacher orchestrator: routes to subagents, assembles response."""
+    trace_id = uuid.uuid4().hex[:12]
     session_mgr = get_session_manager()
+    provider = get_provider()
 
-    # 1. Load or create session
+    # 1. Load session
     session = await session_mgr.load(
         chat_id=message.chat_id,
         user_id=message.user_id,
@@ -197,8 +217,8 @@ async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, No
         course_id=message.course_id,
     )
 
-    # 2. Build system prompt
-    system_prompt = build_system_prompt(
+    # 2. Build teacher prompt
+    system_prompt = build_teacher_prompt(
         course_id=message.course_id,
         class_=message.class_,
         subject=message.subject,
@@ -209,55 +229,178 @@ async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, No
     student_msg = InternalMessage(role="student", content=message.text)
     session.messages.append(student_msg)
 
-    # 4. Get tool definitions and provider
-    tools = get_all_definitions()
-    provider = OpenAIProvider(api_key=settings.openai_api_key)
+    logger.info(
+        "[%s] run() — chat_id=%s msg_count=%d",
+        trace_id,
+        message.chat_id,
+        len(session.messages),
+    )
 
-    # 5. Stream events, collecting full text and stripping thinking from deltas
-    full_text = ""
-    started = False
+    # 4. Teacher LLM call (routing + resolve_chapter)
+    decision = await _run_teacher(
+        system_prompt, session.messages, provider, trace_id,
+    )
 
-    async for event in run_attempt(
-        system_prompt=system_prompt,
-        messages=session.messages,
-        tools=tools,
-        provider=provider,
-        model=settings.primary_model,
-    ):
-        if isinstance(event, ResponseDelta):
-            chunk = event.content
-            full_text += chunk
+    logger.info(
+        "[%s] Teacher decision: type=%s subagents=%s",
+        trace_id,
+        decision.type,
+        [s.agent for s in decision.subagents],
+    )
 
-            # Strip thinking tags from the delta stream
-            clean = strip_thinking(full_text)
-            if clean:
-                if not started:
-                    yield ResponseStartEvent()
-                    started = True
-                # Only yield the new clean content (delta)
-                already_sent = len(full_text) - len(chunk)
-                prev_clean = strip_thinking(full_text[:already_sent])
-                new_clean = clean[len(prev_clean):]
-                if new_clean:
-                    yield ResponseDelta(content=new_clean)
+    # 5. Route
+    if decision.type == "direct_response":
+        text = decision.direct_response or ""
+        cards: list[dict] = []
+        follow_up = decision.follow_up
+    else:
+        # Dispatch subagents in parallel with timeout
+        tasks = [
+            asyncio.wait_for(
+                _dispatch_subagent(d, message, provider),
+                timeout=_SUBAGENT_TIMEOUT_S,
+            )
+            for d in decision.subagents
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        elif isinstance(event, (ResponseStartEvent, ResponseEndEvent)):
-            if isinstance(event, ResponseEndEvent):
-                if started:
-                    yield ResponseEndEvent()
-                else:
-                    clean = strip_thinking(full_text)
-                    if clean:
-                        yield ResponseStartEvent()
-                        yield ResponseDelta(content=clean)
-                        yield ResponseEndEvent()
-        elif isinstance(event, CardsEvent):
-            yield event
-        else:
-            # StatusEvent, ErrorEvent — pass through
-            yield event
+        # Handle exceptions (including TimeoutError)
+        clean_results: list[SubAgentResult] = []
+        for i, r in enumerate(results):
+            if isinstance(r, BaseException):
+                agent_name = decision.subagents[i].agent
+                logger.error("[%s] Subagent %s failed: %s", trace_id, agent_name, r)
+                clean_results.append(
+                    SubAgentResult(status="error", metadata={"error": str(r)})
+                )
+            else:
+                clean_results.append(r)
 
-    # 6. Finalize and save
-    clean_text = strip_thinking(full_text)
-    session.messages.append(InternalMessage(role="agent", content=clean_text))
+        text, cards = _assemble_response(decision, clean_results)
+        follow_up = decision.follow_up
+
+        # If all subagents failed and no text, provide fallback
+        if not text and not cards:
+            text = "Abhi kuch technical issue aa raha hai, thodi der mein try karo."
+
+    # 6. Save session
+    session.messages.append(InternalMessage(role="agent", content=text))
+    await session_mgr.save(session)
+
+    return AgentResponse(
+        text=text,
+        cards=cards,
+        follow_up=follow_up,
+        metadata={
+            "chat_id": message.chat_id,
+            "trace_id": trace_id,
+            "teacher_model": settings.fast_model,
+            "routing": decision.type,
+        },
+    )
+
+
+async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, None]:
+    """Streaming teacher orchestrator: yields events in real-time."""
+    trace_id = uuid.uuid4().hex[:12]
+    session_mgr = get_session_manager()
+    provider = get_provider()
+
+    # 1. Load session
+    session = await session_mgr.load(
+        chat_id=message.chat_id,
+        user_id=message.user_id,
+        subject=message.subject,
+        course_id=message.course_id,
+    )
+
+    # 2. Build teacher prompt
+    system_prompt = build_teacher_prompt(
+        course_id=message.course_id,
+        class_=message.class_,
+        subject=message.subject,
+        language=message.language,
+    )
+
+    # 3. Append student message
+    student_msg = InternalMessage(role="student", content=message.text)
+    session.messages.append(student_msg)
+
+    # 4. Teacher routing
+    yield StatusEvent(content="Samajh raha hoon kya chahiye...")
+
+    decision = await _run_teacher(
+        system_prompt, session.messages, provider, trace_id,
+    )
+
+    logger.info(
+        "[%s] Teacher decision (stream): type=%s subagents=%s",
+        trace_id,
+        decision.type,
+        [s.agent for s in decision.subagents],
+    )
+
+    # 5. Route and stream results
+    if decision.type == "direct_response":
+        text = decision.direct_response or ""
+        yield ResponseStartEvent()
+        yield ResponseDelta(content=text)
+        yield ResponseEndEvent()
+
+        if decision.follow_up:
+            yield FollowUpEvent(content=decision.follow_up)
+
+        session.messages.append(InternalMessage(role="agent", content=text))
+
+    else:
+        # Emit nudges for each subagent
+        for dispatch in decision.subagents:
+            if dispatch.nudge:
+                yield StatusEvent(content=dispatch.nudge)
+
+        # Dispatch subagents in parallel with timeout
+        tasks = [
+            asyncio.wait_for(
+                _dispatch_subagent(d, message, provider),
+                timeout=_SUBAGENT_TIMEOUT_S,
+            )
+            for d in decision.subagents
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle exceptions (including TimeoutError)
+        clean_results: list[SubAgentResult] = []
+        for i, r in enumerate(results):
+            if isinstance(r, BaseException):
+                agent_name = decision.subagents[i].agent
+                logger.error("[%s] Subagent %s failed: %s", trace_id, agent_name, r)
+                clean_results.append(
+                    SubAgentResult(status="error", metadata={"error": str(r)})
+                )
+            else:
+                clean_results.append(r)
+
+        text, cards = _assemble_response(decision, clean_results)
+
+        # If all subagents failed
+        if not text and not cards:
+            text = "Abhi kuch technical issue aa raha hai, thodi der mein try karo."
+
+        # Stream text response
+        if text:
+            yield ResponseStartEvent()
+            yield ResponseDelta(content=text)
+            yield ResponseEndEvent()
+
+        # Stream cards
+        if cards:
+            yield CardsEvent(content=cards)
+
+        # Stream follow-up
+        if decision.follow_up:
+            yield FollowUpEvent(content=decision.follow_up)
+
+        session.messages.append(InternalMessage(role="agent", content=text))
+
+    # 6. Save session
     await session_mgr.save(session)

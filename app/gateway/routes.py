@@ -36,6 +36,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         cards=response.cards,
         buttons=response.buttons,
         metadata=response.metadata,
+        follow_up=response.follow_up,
     )
 
 

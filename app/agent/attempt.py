@@ -15,12 +15,17 @@ from app.tools.registry import execute_tool
 logger = logging.getLogger(__name__)
 
 
+MAX_TOOL_ITERATIONS = 10
+
+
 async def run_attempt(
     system_prompt: str,
     messages: list[InternalMessage],
     tools: list[ToolDefinition],
     provider: LLMProvider,
     model: str,
+    response_format: dict | None = None,
+    max_iterations: int = MAX_TOOL_ITERATIONS,
 ) -> AsyncGenerator[AgentEvent, None]:
     """Run a single LLM attempt with tool loop. Stateless — no session or retry logic."""
     logger.info(
@@ -31,11 +36,25 @@ async def run_attempt(
     iteration = 0
     while True:
         iteration += 1
+        if iteration > max_iterations:
+            logger.error(
+                "Tool loop hit max iterations (%d), forcing stop",
+                max_iterations,
+            )
+            yield ResponseStartEvent()
+            yield ResponseDelta(
+                content="Abhi request complete nahi ho payi, "
+                "please dobara try karo."
+            )
+            yield ResponseEndEvent()
+            return
+
         response: LLMResponse = await provider.chat(
             system_prompt=system_prompt,
             messages=messages,
             tools=tools,
             model=model,
+            response_format=response_format,
         )
 
         if response.has_tool_calls:

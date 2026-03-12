@@ -25,6 +25,7 @@ class ChatResponse(BaseModel):
     cards: list[dict] = Field(default_factory=list)
     buttons: list[dict] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+    follow_up: str | None = None
 
 
 @dataclass

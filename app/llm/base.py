@@ -22,6 +22,7 @@ class LLMResponse:
     text: str | None = None
     tool_calls: list[dict] = field(default_factory=list)
     has_tool_calls: bool = False
+    usage: dict = field(default_factory=dict)
     raw: Any = None
 
 
@@ -35,6 +36,7 @@ class LLMProvider(ABC):
         messages: list[InternalMessage],
         tools: list[ToolDefinition],
         model: str,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Send a chat request to the LLM provider."""
         ...

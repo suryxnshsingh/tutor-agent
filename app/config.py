@@ -10,7 +10,8 @@ class Settings:
     """Application settings loaded from environment variables."""
 
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    primary_model: str = os.getenv("PRIMARY_MODEL", "gpt-5-mini")
+    primary_model: str = os.getenv("PRIMARY_MODEL", "gpt-4.1-mini")
+    fast_model: str = os.getenv("FAST_MODEL", "gpt-4.1-mini")
     fallback_model: str = os.getenv("FALLBACK_MODEL", "gpt-4.1-mini")
     compaction_model: str = os.getenv("COMPACTION_MODEL", "gpt-5")
 

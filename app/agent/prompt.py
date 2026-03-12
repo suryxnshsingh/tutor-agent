@@ -1,39 +1,31 @@
 import re
-from datetime import datetime
 from pathlib import Path
 
 from app.config import settings
 
-_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "system_prompt.txt"
-_PROMPT_TEMPLATE = _PROMPT_PATH.read_text()
-_COURSE_SNIPPETS_DIR = Path(__file__).parent.parent.parent / "prompts" / "courses"
+_PROMPTS_DIR = Path(__file__).parent.parent.parent / "prompts"
+_TEACHER_PROMPT_PATH = _PROMPTS_DIR / "teacher_prompt.txt"
+_TEACHER_PROMPT_TEMPLATE = _TEACHER_PROMPT_PATH.read_text()
+_COURSE_SNIPPETS_DIR = _PROMPTS_DIR / "courses"
 
 
-def build_system_prompt(
+def build_teacher_prompt(
     course_id: str,
     class_: str,
     subject: str,
     language: str,
     agent_name: str | None = None,
 ) -> str:
-    """Build the full system prompt with student context filled in."""
+    """Build the teacher agent routing prompt with student context."""
     name = agent_name or settings.agent_name
-    # Use manual replacement to avoid issues with curly braces in prompt
-    prompt = _PROMPT_TEMPLATE
+    prompt = _TEACHER_PROMPT_TEMPLATE
     prompt = prompt.replace("{agent_name}", name)
     prompt = prompt.replace("{course}", course_id)
     prompt = prompt.replace("{class}", class_)
     prompt = prompt.replace("{subject}", subject)
     prompt = prompt.replace("{language}", language)
 
-    # Academic year: exams happen Feb-March, so before May the latest
-    # exam year is last calendar year; from May onward it's this year.
-    now = datetime.utcnow()
-    latest_exam_year = now.year if now.month >= 5 else now.year - 1
-    prompt = prompt.replace("{latest_exam_year}", str(latest_exam_year))
-    prompt = prompt.replace("{latest_exam_year_minus_2}", str(latest_exam_year - 2))
-
-    # Append course-specific notes if a snippet exists
+    # Append course-specific notes if available
     snippet_path = _COURSE_SNIPPETS_DIR / f"{course_id}.txt"
     if snippet_path.exists():
         course_notes = snippet_path.read_text().strip()
