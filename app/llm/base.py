@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,7 +39,17 @@ class LLMProvider(ABC):
         model: str,
         response_format: dict | None = None,
     ) -> LLMResponse:
-        """Send a chat request to the LLM provider."""
+        """Send a non-streaming chat request to the LLM provider."""
+        ...
+
+    @abstractmethod
+    def chat_stream(
+        self,
+        system_prompt: str,
+        messages: list[InternalMessage],
+        model: str,
+    ) -> AsyncGenerator[str, None]:
+        """Stream token-by-token text from the LLM. No tool support."""
         ...
 
     @abstractmethod

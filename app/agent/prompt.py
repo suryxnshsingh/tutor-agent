@@ -1,4 +1,5 @@
 import re
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from app.config import settings
@@ -43,3 +44,68 @@ def extract_thinking(response_text: str) -> str | None:
     """Extract thinking content for analytics/logging."""
     match = re.search(r"<thinking>(.*?)</thinking>", response_text, flags=re.DOTALL)
     return match.group(1).strip() if match else None
+
+
+async def filter_thinking_stream(
+    token_stream: AsyncGenerator[str, None],
+) -> AsyncGenerator[str, None]:
+    """Filter <thinking>...</thinking> blocks from a token stream.
+
+    Buffers tokens while inside a thinking block. Yields clean content only.
+    Handles the case where tags are split across multiple tokens.
+    """
+    buffer = ""
+    inside_thinking = False
+
+    async for token in token_stream:
+        buffer += token
+
+        while buffer:
+            if inside_thinking:
+                # Look for closing tag
+                end_idx = buffer.find("</thinking>")
+                if end_idx != -1:
+                    # Skip everything up to and including </thinking>
+                    buffer = buffer[end_idx + len("</thinking>"):]
+                    inside_thinking = False
+                    continue
+                # Might have a partial closing tag at the end — keep buffering
+                if "</thinking>"[:1] in buffer[-len("</thinking>"):]:
+                    break
+                # No closing tag fragment — discard and keep buffering
+                buffer = ""
+                break
+            else:
+                # Look for opening tag
+                start_idx = buffer.find("<thinking>")
+                if start_idx != -1:
+                    # Yield everything before the tag
+                    before = buffer[:start_idx]
+                    if before:
+                        yield before
+                    buffer = buffer[start_idx + len("<thinking>"):]
+                    inside_thinking = True
+                    continue
+                # Check for partial opening tag at end of buffer
+                # e.g. buffer ends with "<thin" — could be start of <thinking>
+                partial = False
+                tag = "<thinking>"
+                for i in range(1, len(tag)):
+                    if buffer.endswith(tag[:i]):
+                        # Yield everything before the partial match
+                        safe = buffer[: -i]
+                        if safe:
+                            yield safe
+                        buffer = buffer[-i:]
+                        partial = True
+                        break
+                if partial:
+                    break
+                # No tag or partial — yield entire buffer
+                yield buffer
+                buffer = ""
+                break
+
+    # Flush remaining buffer (if not inside thinking)
+    if buffer and not inside_thinking:
+        yield buffer

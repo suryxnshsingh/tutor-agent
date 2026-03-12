@@ -1,5 +1,6 @@
 import json
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -164,3 +165,26 @@ class OpenAIProvider(LLMProvider):
 
         response = await self.client.chat.completions.create(**kwargs)
         return self.from_provider_response(response)
+
+    async def chat_stream(
+        self,
+        system_prompt: str,
+        messages: list[InternalMessage],
+        model: str,
+    ) -> AsyncGenerator[str, None]:
+        """Stream token-by-token text from OpenAI. No tool support."""
+        provider_messages = [
+            {"role": "system", "content": system_prompt},
+            *self.to_provider_messages(messages),
+        ]
+
+        stream = await self.client.chat.completions.create(
+            model=model,
+            messages=provider_messages,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                yield delta.content

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncGenerator
 
 from app.agent.prompt import strip_thinking
 from app.agent.subagents.base import SubAgentResult
@@ -57,3 +58,24 @@ async def run_doubt_agent(
         text=text or None,
         metadata={"agent": "doubt", "model": settings.primary_model, "duration_s": elapsed},
     )
+
+
+async def stream_doubt_agent(
+    *,
+    input_text: str,
+    language: str,
+    class_: str,
+    subject: str,
+    course_id: str,
+    provider: LLMProvider,
+) -> AsyncGenerator[str, None]:
+    """Stream tokens from the doubt solver. Yields raw tokens (including thinking tags)."""
+    system_prompt = _build_prompt(language, class_, subject, course_id)
+    messages = [InternalMessage(role="student", content=input_text)]
+
+    async for token in provider.chat_stream(
+        system_prompt=system_prompt,
+        messages=messages,
+        model=settings.primary_model,
+    ):
+        yield token

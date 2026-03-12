@@ -18,11 +18,11 @@ from app.agent.events import (
     ResponseStartEvent,
     StatusEvent,
 )
-from app.agent.prompt import build_teacher_prompt
+from app.agent.prompt import build_teacher_prompt, filter_thinking_stream
 from app.agent.subagents.base import SubAgentDispatch, SubAgentResult, TeacherDecision
 from app.agent.subagents.content import run_content_agent
-from app.agent.subagents.doubt import run_doubt_agent
-from app.agent.subagents.guidance import run_guidance_agent
+from app.agent.subagents.doubt import run_doubt_agent, stream_doubt_agent
+from app.agent.subagents.guidance import run_guidance_agent, stream_guidance_agent
 from app.config import settings
 from app.gateway.models import UniversalMessage
 from app.llm.openai_provider import OpenAIProvider
@@ -300,8 +300,29 @@ async def run(message: UniversalMessage) -> AgentResponse:
     )
 
 
+def _get_text_stream(
+    dispatch: SubAgentDispatch,
+    message: UniversalMessage,
+    provider: OpenAIProvider,
+) -> AsyncGenerator[str, None] | None:
+    """Return a token stream for text-producing agents, or None for card agents."""
+    common = {
+        "input_text": dispatch.input,
+        "language": dispatch.language,
+        "class_": message.class_,
+        "subject": message.subject,
+        "course_id": message.course_id,
+        "provider": provider,
+    }
+    if dispatch.agent == "doubt":
+        return stream_doubt_agent(**common)
+    if dispatch.agent == "guidance":
+        return stream_guidance_agent(**common)
+    return None
+
+
 async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, None]:
-    """Streaming teacher orchestrator: yields events in real-time."""
+    """Streaming teacher orchestrator: streams text tokens in real-time."""
     trace_id = uuid.uuid4().hex[:12]
     session_mgr = get_session_manager()
     provider = get_provider()
@@ -353,54 +374,81 @@ async def run_stream(message: UniversalMessage) -> AsyncGenerator[AgentEvent, No
         session.messages.append(InternalMessage(role="agent", content=text))
 
     else:
-        # Emit nudges for each subagent
+        # Separate text-producing agents (doubt/guidance) from card agents (content)
+        text_dispatches: list[SubAgentDispatch] = []
+        card_dispatches: list[SubAgentDispatch] = []
+        for d in decision.subagents:
+            if d.agent in ("doubt", "guidance"):
+                text_dispatches.append(d)
+            else:
+                card_dispatches.append(d)
+
+        # Emit nudges
         for dispatch in decision.subagents:
             if dispatch.nudge:
                 yield StatusEvent(content=dispatch.nudge)
 
-        # Dispatch subagents in parallel with timeout
-        tasks = [
-            asyncio.wait_for(
-                _dispatch_subagent(d, message, provider),
-                timeout=_SUBAGENT_TIMEOUT_S,
-            )
-            for d in decision.subagents
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Handle exceptions (including TimeoutError)
-        clean_results: list[SubAgentResult] = []
-        for i, r in enumerate(results):
-            if isinstance(r, BaseException):
-                agent_name = decision.subagents[i].agent
-                logger.error("[%s] Subagent %s failed: %s", trace_id, agent_name, r)
-                clean_results.append(
-                    SubAgentResult(status="error", metadata={"error": str(r)})
+        # Start card agents (content) as background tasks
+        card_tasks = [
+            asyncio.create_task(
+                asyncio.wait_for(
+                    _dispatch_subagent(d, message, provider),
+                    timeout=_SUBAGENT_TIMEOUT_S,
                 )
-            else:
-                clean_results.append(r)
+            )
+            for d in card_dispatches
+        ]
 
-        text, cards = _assemble_response(decision, clean_results)
-
-        # If all subagents failed
-        if not text and not cards:
-            text = "Abhi kuch technical issue aa raha hai, thodi der mein try karo."
-
-        # Stream text response
-        if text:
+        # Stream text agents token-by-token
+        collected_text = ""
+        if text_dispatches:
             yield ResponseStartEvent()
-            yield ResponseDelta(content=text)
+            for i, dispatch in enumerate(text_dispatches):
+                if i > 0:
+                    sep = "\n\n"
+                    yield ResponseDelta(content=sep)
+                    collected_text += sep
+
+                raw_stream = _get_text_stream(dispatch, message, provider)
+                if raw_stream is not None:
+                    async for token in filter_thinking_stream(raw_stream):
+                        yield ResponseDelta(content=token)
+                        collected_text += token
             yield ResponseEndEvent()
 
-        # Stream cards
+        # Await card agent results
+        cards: list[dict] = []
+        for i, task in enumerate(card_tasks):
+            try:
+                result = await task
+                if result.cards:
+                    cards.extend(result.cards)
+            except BaseException as e:
+                agent_name = card_dispatches[i].agent
+                logger.error(
+                    "[%s] Card agent %s failed: %s", trace_id, agent_name, e,
+                )
+
+        # Fallback if everything failed
+        if not collected_text and not cards:
+            collected_text = (
+                "Abhi kuch technical issue aa raha hai, thodi der mein try karo."
+            )
+            yield ResponseStartEvent()
+            yield ResponseDelta(content=collected_text)
+            yield ResponseEndEvent()
+
+        # Emit cards
         if cards:
             yield CardsEvent(content=cards)
 
-        # Stream follow-up
+        # Emit follow-up
         if decision.follow_up:
             yield FollowUpEvent(content=decision.follow_up)
 
-        session.messages.append(InternalMessage(role="agent", content=text))
+        session.messages.append(
+            InternalMessage(role="agent", content=collected_text),
+        )
 
     # 6. Save session
     await session_mgr.save(session)
